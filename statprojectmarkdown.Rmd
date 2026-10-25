@@ -1,0 +1,507 @@
+# Stat 333 Project 
+### Casey Gudwien Stoll
+```{r}
+rm(list = ls()) #initialization
+
+#packages
+library(dplyr)
+library(pROC)
+library(ggplot2)
+library(arm)
+library(corrplot)
+library(car)
+library(MASS)
+library(DescTools)
+```
+
+###Part One: Cleaning the data
+
+First I converted all of the time columns not containing time durations to CST and turned it into a new csv file.
+```{r}
+data <- read.csv("AirlineData.csv")
+dataframe = data.frame(data)
+getTimeOffset <- function(state, city) {
+
+  offset <- rep(0, length(state))
+  
+  offset[state == "AK"] <- 300 
+  offset[state == "HI"] <- 400
+  offset[state == "PR"] <- -200
+  
+
+  east_states <- c("CT","DE","DC","GA","IN","ME","MD","MA","MI",
+                   "NH","NJ","NY","NC","OH","PA","RI","SC","VT","VA","WV")
+  offset[state %in% east_states] <- -100
+  
+  offset[state == "FL"] <- -100
+  offset[state == "FL" & city == "Pensacola, FL"] <- 0
+  
+  offset[state == "KY"] <- -100
+  offset[state == "KY" & city == "Paducah, KY"] <- 0
+  
+  offset[state == "TN"] <- 0
+  offset[state == "TN" & (city == "Chattanooga, TN" | city == "Knoxville, TN")] <- -100
+  
+  mountain_states <- c("AZ","CO","ID","MT","NM") 
+  offset[state %in% mountain_states] <- 100
+  
+  offset[state == "SD" & city == "Rapid City, SD"] <- 100
+  
+  offset[state == "TX" & city == "El Paso, TX"] <- 100
+  
+  pac_states <- c("CA","NV","OR","WA")
+  offset[state %in% pac_states] <- 200
+  
+  return(offset)
+}
+
+
+time_offsets <- getTimeOffset(dataframe$Dep_State, dataframe$Dep_City)
+
+cols_to_fix <- c(14,15,18,19,23)
+
+cleanedDF <- dataframe
+for(j in cols_to_fix) {
+  cleanedDF[, j] <- dataframe[, j] + time_offsets
+  
+}
+
+```
+
+Next, since many of the rows were missing their dates I used the Month and Day column to reassign them their date values.
+
+```{r}
+
+df = cleanedDF
+newdf = df[,1:27]
+
+year_col <- ifelse(df$Month == "Jan", "2024", "2023")
+date_strings <- paste(df$Month, df$Day, year_col, sep="-")
+real_dates <- as.Date(date_strings, format = "%b-%d-%Y")
+newdf$Flight_Date <- format(real_dates, "%m/%d/%Y")
+```
+
+After this, since the project deliverables were to gather simple tips or takeaways to prevent canceled flights or delays, I removed all of the columns that would cause data leakage or redundancy such as Arr_Time_Actual.
+
+```{r}
+
+newdf <- subset(newdf, select = -c(Dep_City, Dep_State, Arr_Time_Actual, Wheels_On, Arr_Taxi_Time, Elapsed_Time_Actual))
+```
+
+Then I created new predictors that would be simple for passengers to understand such as Time_bin, or is_holiday, to see how holidays or time of day will effect cancelations or delay.
+
+```{r}
+times <- c(0, 600, 1200, 1800, 2400)
+bins <- c("Night", "Morning", "Afternoon", "Evening")
+
+newdf$Time_Block <- cut(newdf$Dep_Time_Scheduled, 
+                     breaks = times, 
+                     labels = bins, 
+                     include.lowest = TRUE)
+
+holidays = c("11/11/2023","11/23/2023", "12/25/2023", "01/01/2024")
+newdf$is_holiday <- ifelse(newdf$Flight_Date %in% holidays, "True", "False")
+                           
+newdf %>% count(Dep_Airport)
+top_20 = c("ATL", "BNA", "BOS", "CLT", "DCA", "DEN", "DFW", "DTW", "EWR", "IAH", "LAS", "LAX", "LGA", "MCO", "MIA", "MKE", "MSN", "MSP", "ORD", "PHX", "STL")
+newdf$Reduced_Dep_Airport <- ifelse(newdf$Dep_Airport %in% top_20, newdf$Dep_Airport, "Other")
+```
+
+In this section I also created the new column, Reduced_Dep_Airport, since the original column has many airports. To make the models more interpretable I reduced the amount of dummy variables for airports to only the top 20 most used airports, and assigned the value Other to all other airports for simplicity.
+
+### Part 2: Graphs / EDA
+
+After cleaning the data and dropping/adding columns to our data set, I then wanted to explore our data set using graphs, and make graphs that would be easy for people to draw takeaways from.
+
+First I wanted to see how the days of the week was related to flight cancelations, giving us these graphs.
+```{r}
+day_cancels = table(newdf$Week[newdf$Cancelled == 1])
+newdf$Week <- factor(newdf$Week, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+day_cancels_vector <- table(newdf$Week[newdf$Cancelled == 1])
+barplot(day_cancels_vector, main = "Frequency of Cancellations by Day", las = 1, ylab = "# of Cancelations", xlab = "Days of the Week")
+
+
+Mon =  sum(newdf$Week == "Mon" & newdf$Cancelled == 1) / sum(newdf$Week == "Mon") 
+Tue = sum(newdf$Week == "Tue" & newdf$Cancelled == 1) / sum(newdf$Week == "Tue") 
+Wed = sum(newdf$Week == "Wed" & newdf$Cancelled == 1) / sum(newdf$Week == "Wed") 
+Thu = sum(newdf$Week == "Thu" & newdf$Cancelled == 1) / sum(newdf$Week == "Thu") 
+Fri = sum(newdf$Week == "Fri" & newdf$Cancelled == 1) / sum(newdf$Week == "Fri") 
+Sat = sum(newdf$Week == "Sat" & newdf$Cancelled == 1) / sum(newdf$Week == "Sat") 
+Sun = sum(newdf$Week == "Sun" & newdf$Cancelled == 1) / sum(newdf$Week == "Sun") 
+
+props = c(Mon, Tue, Wed, Thu, Fri, Sat, Sun)
+names(props) <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+barplot(props, xlab = "Days of the Week", ylab = "Proportion of Cancelations", main = "Proportion of Cancellations by Day")
+```
+
+Next I wanted to see the relationship between airlines and cancellations.
+```{r}
+airline_cancels <- newdf %>%
+  group_by(Airline) %>%
+  summarise(Total_Cancellations = sum(Cancelled, na.rm = TRUE))
+
+ggplot(airline_cancels, aes(x = Airline, y = Total_Cancellations, fill = Airline)) +
+  geom_col() +  
+  geom_text(aes(label = Total_Cancellations), vjust = -0.5) + 
+  labs(title = "Total Cancellations by Airline",
+       x = "Airline",
+       y = "Count of Cancelled Flights") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+airline_props <- newdf %>%
+  group_by(Airline) %>%
+  summarise(Cancellation_Rate = mean(Cancelled, na.rm = TRUE))
+
+ggplot(airline_props, aes(x = Airline, y = Cancellation_Rate, fill = Airline)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(Cancellation_Rate, accuracy = 0.1)), vjust = -0.5) +
+  labs(title = "Cancellation Rate by Airline",
+       subtitle = "Percentage of scheduled flights that were cancelled",
+       x = "Airline",
+       y = "Proportion Cancelled") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+And finnally, rounding out the graphs showing cancellation statistics, I did cancellation by time block
+
+```{r}
+time_stats = newdf %>% group_by(Time_Block) %>% summarise(sum_cancels = sum(Cancelled, na.rm = TRUE))
+ggplot(time_stats, aes(x= Time_Block, y = sum_cancels)) + geom_col(fill = "violet") + labs(title = "Number of Cancelations by Time of Day", y = "Cancellations")
+
+time_counts <- table(newdf$Time_Block)
+barplot(time_counts, 
+        main = "Number of Flights by Time of Day",
+        xlab = "Time Block",
+        ylab = "Number of Flights",
+        col = "lightblue",
+        las = 1)
+
+```
+
+Moving on to graphs displaying information about arrival delay, I started with seeing if the how the airline might be related to arrival delay.
+
+
+
+```{r}
+
+airline_stats <- newdf %>%
+  group_by(Airline) %>%
+  summarise(Mean_Delay = mean(Arr_Delay, na.rm = TRUE))
+
+ggplot(airline_stats, aes(x = Airline, y = Mean_Delay)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Average Arrival Delay by Airline", y = "Minutes")
+
+time_stats = newdf %>%
+  group_by(Time_Block) %>%
+  summarise(Mean_Delay = mean(Arr_Delay, na.rm = TRUE))
+
+ggplot(time_stats, aes(x = Time_Block, y = Mean_Delay)) +
+  geom_col(fill = "blue") +
+  labs(title = "Average Arrival Delay by Time Block", y = "Minutes")
+
+#Combining these we get:
+
+interaction_data <- newdf %>%
+  group_by(Airline, Time_Block) %>%
+  summarise(Avg_Delay = mean(Arr_Delay, na.rm = TRUE))
+
+interaction_data$Time_Block <- factor(interaction_data$Time_Block, 
+                                      levels = c("Morning", "Afternoon", "Evening", "Night"))
+
+ggplot(interaction_data, aes(x = Time_Block, y = Avg_Delay, color = Airline, group = Airline)) +
+  geom_line(linewidth = 1) +  # Thicker lines
+  geom_point() +
+  labs(title = "Airline Delays by Time of Day",
+       x = "Time of Day",
+       y = "Average Delay (Minutes)") +
+  theme_minimal()
+
+
+```
+
+Following this I did the same thing with day of the week.
+
+```{r}
+Week_stats = newdf %>% group_by(Week) %>% summarise(Mean_Delay = mean(Arr_Delay, na.rm = TRUE))
+ggplot(Week_stats, aes(x= Week, y = Mean_Delay)) + geom_col(fill = "darkgreen") + labs(title = "Average Arrival Delay by Day of the Week", y = "Minutes")
+
+```
+
+Finally, I added in some heatmaps to see how our predictors interacted with one another.
+
+```{r}
+heatmap_data <- newdf %>%
+  group_by(Airline, Week) %>%
+  summarise(Avg_Delay = mean(Arr_Delay, na.rm = TRUE))
+
+heatmap_data$Week <- factor(heatmap_data$Week, 
+                            levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+
+ggplot(heatmap_data, aes(x = Week, y = Airline, fill = Avg_Delay)) +
+  geom_tile() + 
+  scale_fill_gradient(low = "green", high = "red") + # Green = Good, Red = Bad
+  labs(title = "Heatmap: Airline Delays by Day of Week",
+       x = "Day of Week",
+       y = "Airline",
+       fill = "Avg Delay (Min)") +
+  theme_minimal()
+
+heatmap_data2 = newdf %>% group_by(Time_Block, Week) %>% summarise(Avg_Delay = mean(Arr_Delay, na.rm = TRUE))
+heatmap_data2$Week = factor(heatmap_data2$Week, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+ggplot(heatmap_data2, aes(x = Week, y = Time_Block, fill = Avg_Delay)) + geom_tile() + scale_fill_gradient(low = "green", high = "red") + labs(title = "Heatmap: Time of Day Delays by Day of Week",   y = "Time of Day",fill = "Avg Delay (Min)") + theme_minimal()                                                                                                                                        
+heatmap_data3 <- newdf %>%
+  group_by(Airline, Time_Block) %>%
+  summarise(Avg_Delay = mean(Arr_Delay, na.rm = TRUE))
+
+
+heatmap_data3$Time_Block <- factor(heatmap_data3$Time_Block, 
+                                   levels = c("Morning", "Afternoon", "Evening", "Night"))
+
+ggplot(heatmap_data3, aes(x = Time_Block, y = Airline, fill = Avg_Delay)) +
+  geom_tile() + 
+  scale_fill_gradient(low = "green", high = "red") + 
+  labs(title = "Heatmap: Airline Delays by Time of Day",
+       x = "Time of Day",
+       y = "Airline",
+       fill = "Avg Delay (Min)") +
+  theme_minimal()
+```
+
+### Part Three: Logistic Regression
+
+First we have to set up our data to test of regression models.
+
+```{r}
+set.seed(42) 
+
+n <- nrow(newdf)
+
+train_index <- sample(1:n, size = 0.8 * n)
+
+train_df <- newdf[train_index, ]  # The 80% to build the model
+test_df  <- newdf[-train_index, ] # The 20% to test the model
+```
+
+Next I checked to see which linker function is better for our glm, logit vs probit.
+
+```{r}
+model_logit <- glm(Cancelled ~ Airline + Week + Reduced_Dep_Airport + Month + is_holiday + Time_Block, 
+                   family = binomial(link = "logit"), 
+                   data = train_df)
+
+model_probit <- glm(Cancelled ~ Airline + Week + Reduced_Dep_Airport + Month + is_holiday + Time_Block, 
+                    family = binomial(link = "probit"), 
+                    data = train_df)
+
+probs <- predict(model_logit, newdata = test_df, type = "response") 
+auc(roc(test_df$Cancelled, probs))
+probs2 = predict(model_probit, newdata = test_df, type = "response")
+auc(roc(test_df$Cancelled, probs2))
+AIC(model_logit)
+AIC(model_probit)
+```
+
+Since they are similar, I went with logits for better interpretability.
+
+Next I tested some reduced models based on different ideas such as, which variables the passanger can control, or how does the airline predictor interact with airport predictor.
+```{r}
+model_full <- glm(Cancelled ~ Airline + Week + Reduced_Dep_Airport + Month + Time_Block + Dist_Dep_Arr, 
+                  family = binomial, data = train_df)
+
+model_reduced = glm(Cancelled ~ Airline + Week + Reduced_Dep_Airport + Month + Time_Block, 
+                    family = binomial, data = train_df)
+
+model_passenger <- glm(Cancelled ~ Airline + Week + Month + Time_Block, 
+                       family = binomial, data = train_df)
+
+model_reduced2 <- glm(Cancelled ~ Airline + Reduced_Dep_Airport + Week + Time_Block, 
+                       family = binomial, data = train_df)
+
+model_interaction <- glm(Cancelled ~ Airline * Reduced_Dep_Airport + Time_Block, 
+                         family = binomial, data = train_df)
+
+AIC(model_full, model_reduced, model_passenger, model_reduced2, model_interaction)
+```
+
+Many of the models have a similar AIC value so I decided to also check their AUC's.
+
+```{r}
+probs <- predict(model_full, newdata = test_df, type = "response") 
+auc(roc(test_df$Cancelled, probs))
+probs <- predict(model_reduced, newdata = test_df, type = "response") 
+auc(roc(test_df$Cancelled, probs))
+probs <- predict(model_passenger, newdata = test_df, type = "response") 
+auc(roc(test_df$Cancelled, probs))
+probs <- predict(model_reduced2, newdata = test_df, type = "response") 
+auc(roc(test_df$Cancelled, probs))
+probs <- predict(model_interaction, newdata = test_df, type = "response") 
+auc(roc(test_df$Cancelled, probs))
+```
+
+Doing this we find that the AIC’s and AUC’s between the full model and the passenger model are similar so I will go with the passenger model since it is more interpretable and actionable for passengers.
+
+
+```{r}
+summary(model_passenger)
+anova2 = Anova(model_passenger, type = "II")
+print(anova2)
+```
+
+
+Looking at this summary we can see that the Time Blocks are not statistically significant, so we can make a reduced model removing these predictors
+
+```{r}
+model_passenger2 = glm(Cancelled ~ Airline + Week + Month, family = binomial, data = train_df)
+AIC(model_passenger2)
+probs <- predict(model_passenger2, newdata = test_df, type = "response") 
+roc_obj = roc(test_df$Cancelled, probs)
+auc(roc_obj)
+
+plot(roc_obj, main = "ROC Curve: Passenger Model", col = "blue", print.auc = TRUE)
+resid_vals <- residuals(model_passenger2, type = "response")
+
+binnedplot(fitted(model_passenger2), 
+           resid_vals, 
+           main = "Binned Residual Plot",
+           xlab = "Predicted Probability",
+           ylab = "Average Residual")
+```
+
+Looking at the AIC and AUC of this model, we can see that its their values are similar to the full model (AIC = 21943 vs AIC = 21691, AUC  = .878 vs AUC = .881) and most of the points in the binned residual plot fall within the 95% error bounds, meaning our model fits our assumptions.
+
+I also made a passenger3 model by adding the the Reduced_Dep_Airport predictors to the model to see how this would affect our model.
+```{r}
+model_passenger3 = glm(Cancelled ~ Airline + Week + Month+ Reduced_Dep_Airport, family = binomial, data = train_df)
+
+AIC(model_passenger3)
+probs <- predict(model_passenger3, newdata = test_df, type = "response") 
+auc(roc(test_df$Cancelled, probs))
+
+resid_vals <- residuals(model_passenger3, type = "response")
+
+binnedplot(fitted(model_passenger3), 
+           resid_vals, 
+           main = "Binned Residual Plot",
+           xlab = "Predicted Probability",
+           ylab = "Average Residual")
+
+PseudoR2(model_passenger3)
+
+```
+Comparing the passenger3 model to passenger, after adding the Reduced_Dep_Airport predictors to the model we get a larger AUC and smaller AIC value (AIC = 21918, AUC = .88) indicating a more accurate model, however I also understand that many passengers won’t change what airport the fly out of to avoid cancellations.
+
+Finally we check our VIF values to make sure our model isn't exhibiting any multicolinearity.
+
+```{r}
+summary(model_passenger3)
+vif_values2 = vif(model_passenger3)
+
+print(vif_values2)
+```
+
+Since all of the GVIF^(1/(2*Df)) values are below 2, we can confidently conclude that none of our predictors exhibit problematic multicollinearity.
+
+### Part 4: Delay MLR
+
+Now for our MLMs prediciting Arrival delay I created many models to compare against each other.
+Doing this I found that dep_delay was a very significant predictor of Arr_delay, however this is uncontrollable by the passenger making it not as useful.
+
+```{r}
+
+model_delay_full <- lm(Arr_Delay ~ Dep_Delay + Airline + Month + Week + Time_Block + Dist_Dep_Arr + Reduced_Dep_Airport + is_holiday, 
+                       data = train_df)
+
+model_delay_control <- lm(Arr_Delay ~ Airline + Month + Week + Time_Block + Reduced_Dep_Airport  + is_holiday + Dist_Dep_Arr, 
+                                           data = train_df)
+
+model_delay_passenger <- lm(Arr_Delay ~ Airline + Month + Week + Time_Block + Reduced_Dep_Airport + is_holiday, 
+                                           data = train_df)
+
+model_delay_planning <- lm(Arr_Delay ~ Airline + Month + Week + Time_Block   + is_holiday, 
+                           data = train_df)
+
+model_delay_recovery <- lm(Arr_Delay ~ Dep_Delay * Dist_Dep_Arr + Airline, 
+                           data = train_df)
+
+model_home_field <- lm(Arr_Delay ~ Airline * Reduced_Dep_Airport + Month + Time_Block, 
+                       data = train_df)
+
+model_rush_hour <- lm(Arr_Delay ~ Airline * Time_Block + Month, 
+                      data = train_df)
+
+AIC(model_delay_full, model_delay_control, model_delay_passenger, model_delay_planning, model_delay_recovery, model_home_field, model_rush_hour)
+
+summary(model_delay_full)$adj.r.squared
+summary(model_delay_control)$adj.r.squared
+summary(model_delay_passenger)$adj.r.squared
+summary(model_delay_planning)$adj.r.squared
+summary(model_delay_recovery)$adj.r.squared
+summary(model_home_field)$adj.r.squared
+summary(model_rush_hour)$adj.r.squared
+```
+
+I also calculated the MSPE for all of the models to see which are the best at predicting exact delay.
+
+```{r}
+calc_mspe <- function(model, test_data) {
+  preds <- predict(model, newdata = test_data)
+  mean((test_data$Arr_Delay - preds)^2, na.rm = TRUE)
+}
+
+calc_mspe(model_delay_full, test_df)
+calc_mspe(model_delay_control, test_df)
+calc_mspe(model_delay_passenger, test_df)
+calc_mspe(model_delay_planning, test_df)
+calc_mspe(model_delay_recovery, test_df)
+calc_mspe(model_home_field, test_df)
+calc_mspe(model_rush_hour, test_df)
+
+```
+
+I decided to go with the model, model_delay_control since many of the predictors in this model are somewhat controllable by the passenger.
+
+```{r}
+summary(model_delay_control)
+delay_vifs = vif(model_delay_control)
+print(delay_vifs)
+
+anova_dep_delay <- anova(model_delay_control, model_delay_full)
+print(anova_dep_delay)
+  
+anova_interaction <- anova(model_delay_planning, model_home_field)
+print(anova_interaction)
+  
+anova_importance <- Anova(model_delay_control, type = "II")
+print(anova_importance)
+```
+
+Looking above we see that all of the predictors in model_delay_control are statistically significant, and do not display multicollinearity since their GVIF/(1/(2DF)) values are well below 2.
+
+```{r}
+plot(model_delay_control)
+
+shift_val <- abs(min(train_df$Arr_Delay, na.rm=TRUE)) + 1
+
+bc = boxcox(Arr_Delay + shift_val ~ Airline + Month + Week + Time_Block + Reduced_Dep_Airport  + is_holiday + Dist_Dep_Arr, data = train_df)
+(lambda <- bc$x[which.max(bc$y)])
+lambda
+
+train_df$Arr_Delay_Transformed <- ((train_df$Arr_Delay + shift_val)^lambda - 1) / lambda
+
+model_delay_transformed <- lm(Arr_Delay_Transformed ~ Airline + Month + Week + Time_Block + Reduced_Dep_Airport  + is_holiday + Dist_Dep_Arr, 
+                          data = train_df)
+
+plot(model_delay_transformed)
+
+AIC(model_delay_transformed)
+summary(model_delay_transformed)
+calc_mspe(model_delay_transformed, test_df)
+```
+
+Now testing our assumptions, we can see that our linearity assumption and hold since the LOESS line in our residual plot is flat, and we also know by the Central Limit Theorem that our model is normally distributed since we have well over 10,000 observations. However, we do see a fanning in our residual plot indicating heteroscedasticity. I tried to fix this by transforming our response variable using the boxcox transformation, but this drives our MSPE up and makes the our model less interpretable so I decided to go with our original model despite heteroscedasticity.
+
